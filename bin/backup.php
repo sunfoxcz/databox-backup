@@ -11,8 +11,10 @@ use TomasKulhanek\Serializer\SerializerFactory;
 
 require __DIR__ . '/../vendor/autoload.php';
 
+$verbose = in_array('-v', $argv, true);
 $configPath = __DIR__ . '/../config.neon';
 $dataDir = __DIR__ . '/../data';
+$logFile = __DIR__ . '/../data/error.log';
 
 try {
     $config = Config::load($configPath);
@@ -26,17 +28,19 @@ $serializer = SerializerFactory::create();
 $provider = GuzzleClientProvider::create();
 $connector = new Connector($serializer, $provider);
 
-$service = new BackupService($connector, $dataDir);
+$service = new BackupService($connector, $dataDir, $logFile, $verbose);
 
 $exitCode = 0;
 foreach ($config->getDataboxes() as $databox) {
     try {
         $service->backup($databox, $config->isProduction());
     } catch (\Throwable $e) {
-        echo sprintf("\nFATAL ERROR for databox %s: %s\n", $databox['id'], $e->getMessage());
+        fwrite(STDERR, sprintf("\n\033[1;31mFATAL ERROR for databox %s:\033[0m %s\n", $databox['id'], $e->getMessage()));
         $exitCode = 1;
     }
 }
 
-echo "\nBackup complete.\n";
+if ($verbose) {
+    echo "\nBackup complete.\n";
+}
 exit($exitCode);

@@ -10,6 +10,7 @@ use TomasKulhanek\CzechDataBox\DTO\MessageRecord;
 use TomasKulhanek\CzechDataBox\DTO\Request\GetListOfReceivedMessages;
 use TomasKulhanek\CzechDataBox\DTO\Request\GetListOfSentMessages;
 use TomasKulhanek\CzechDataBox\DTO\Request\MessageDownload;
+use TomasKulhanek\CzechDataBox\DTO\Request\SignedSentMessageDownload;
 use TomasKulhanek\CzechDataBox\Enum\FilterEnum;
 use TomasKulhanek\CzechDataBox\Enum\LoginTypeEnum;
 
@@ -26,6 +27,8 @@ final class BackupService
     public function __construct(
         private readonly Connector $connector,
         private readonly string $dataDir,
+        private readonly string $logFile,
+        private readonly bool $verbose = false,
     ) {
     }
 
@@ -39,7 +42,7 @@ final class BackupService
         $account = $this->createAccount($databox, $production);
         $boxId = $databox['id'];
 
-        echo sprintf("\n=== Backing up databox: %s ===\n", $boxId);
+        $this->log(sprintf("\n\033[1;36m>>> Backing up databox: %s\033[0m\n", $boxId));
 
         $this->backupMessages($account, $boxId, 'received');
         $this->backupMessages($account, $boxId, 'sent');
@@ -66,7 +69,7 @@ final class BackupService
      */
     private function backupMessages(Account $account, string $boxId, string $direction): void
     {
-        echo sprintf("\n--- %s messages ---\n", ucfirst($direction));
+        $this->log(sprintf("\n\033[1m--- %s messages ---\033[0m\n", ucfirst($direction)));
 
         $offset = 0;
         $downloaded = 0;
@@ -85,7 +88,7 @@ final class BackupService
 
                 if ($messageId === null) {
                     $errors++;
-                    echo "  ERROR: Message record with null ID, skipping\n";
+                    $this->logError($boxId, $direction, 'null', 'Message record with null ID, skipping');
                     continue;
                 }
 
@@ -103,12 +106,12 @@ final class BackupService
                 }
 
                 try {
-                    $this->downloadAndSave($account, $messageId, $targetDir, $record);
+                    $this->downloadAndSave($account, $messageId, $targetDir, $record, $direction);
                     $downloaded++;
-                    echo sprintf("  Downloaded: %s (%s)\n", $messageId, $record->getAnnotation() ?? 'no subject');
+                    $this->log(sprintf("  \033[32m+\033[0m %s \033[2m(%s)\033[0m\n", $messageId, $record->getAnnotation() ?? 'no subject'));
                 } catch (\Throwable $e) {
                     $errors++;
-                    echo sprintf("  ERROR [%s]: %s\n", $messageId, $e->getMessage());
+                    $this->logError($boxId, $direction, $messageId, $e->getMessage());
                 }
             }
 
@@ -119,7 +122,15 @@ final class BackupService
             $offset += self::PAGE_LIMIT;
         }
 
-        echo sprintf("  Total: %d downloaded, %d skipped, %d errors\n", $downloaded, $skipped, $errors);
+        $summary = sprintf(
+            "  \033[32m%d downloaded\033[0m, \033[33m%d skipped\033[0m",
+            $downloaded,
+            $skipped,
+        );
+        if ($errors > 0) {
+            $summary .= sprintf(", \033[31m%d errors\033[0m", $errors);
+        }
+        $this->log($summary . "\n");
     }
 
     /**
@@ -181,6 +192,10 @@ final class BackupService
     /**
      * Downloads a single message and saves its envelope metadata and attachments.
      *
+     * For received messages: downloads full message with individual attachments.
+     * For sent messages: ISDS only provides signed download (SignedSentMessageDownload),
+     * which returns a PKCS#7 signed blob saved as message.zfo.
+     *
      * @throws \RuntimeException When message data cannot be retrieved or directory cannot be created
      */
     private function downloadAndSave(
@@ -188,16 +203,8 @@ final class BackupService
         string $messageId,
         string $targetDir,
         MessageRecord $record,
+        string $direction,
     ): void {
-        $downloadRequest = new MessageDownload();
-        $downloadRequest->setDataMessageId($messageId);
-        $downloadResponse = $this->connector->messageDownload($account, $downloadRequest);
-
-        $message = $downloadResponse->getReturnedMessage();
-        if ($message === null) {
-            throw new \RuntimeException('No message data returned');
-        }
-
         if (!mkdir($targetDir, 0755, true) && !is_dir($targetDir)) {
             throw new \RuntimeException(sprintf('Failed to create directory: %s', $targetDir));
         }
@@ -220,7 +227,27 @@ final class BackupService
             json_encode($envelope, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE),
         );
 
-        // Save attachments from the message envelope
+        if ($direction === 'sent') {
+            $this->downloadSentMessage($account, $messageId, $targetDir);
+        } else {
+            $this->downloadReceivedMessage($account, $messageId, $targetDir);
+        }
+    }
+
+    /**
+     * Downloads a received message and saves individual attachments.
+     */
+    private function downloadReceivedMessage(Account $account, string $messageId, string $targetDir): void
+    {
+        $downloadRequest = new MessageDownload();
+        $downloadRequest->setDataMessageId($messageId);
+        $downloadResponse = $this->connector->messageDownload($account, $downloadRequest);
+
+        $message = $downloadResponse->getReturnedMessage();
+        if ($message === null) {
+            throw new \RuntimeException('No message data returned');
+        }
+
         $dataMessage = $message->getDataMessage();
         $files = $dataMessage->getFiles();
         $usedFilenames = [];
@@ -263,5 +290,50 @@ final class BackupService
                 );
             }
         }
+    }
+
+    /**
+     * Downloads a sent message as a signed .zfo file.
+     *
+     * ISDS does not support MessageDownload for sent messages — only SignedSentMessageDownload,
+     * which returns the entire message as a PKCS#7 signed blob.
+     */
+    private function downloadSentMessage(Account $account, string $messageId, string $targetDir): void
+    {
+        $downloadRequest = new SignedSentMessageDownload();
+        $downloadRequest->setDataMessageId($messageId);
+        $downloadResponse = $this->connector->signedSentMessageDownload($account, $downloadRequest);
+
+        $signature = $downloadResponse->getSignature();
+        if ($signature === null) {
+            throw new \RuntimeException('No signed message data returned');
+        }
+
+        file_put_contents(
+            $targetDir . '/message.zfo',
+            $signature->getContents(),
+        );
+    }
+
+    private function log(string $message): void
+    {
+        if ($this->verbose) {
+            echo $message;
+        }
+    }
+
+    private function logError(string $boxId, string $direction, string $messageId, string $message): void
+    {
+        $line = sprintf(
+            "[%s] %s/%s/%s: %s\n",
+            date('Y-m-d H:i:s'),
+            $boxId,
+            $direction,
+            $messageId,
+            $message,
+        );
+
+        fwrite(STDERR, sprintf("  \033[31mERROR [%s]:\033[0m %s\n", $messageId, $message));
+        file_put_contents($this->logFile, $line, FILE_APPEND);
     }
 }
