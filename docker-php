@@ -1,0 +1,6 @@
+#!/bin/bash
+docker run --rm -i \
+    -v "$(pwd)":/app \
+    --workdir /app \
+    --user "$(id -u)":"$(id -g)" \
+    sunfoxcz/php:8.4-cli php "$@"
