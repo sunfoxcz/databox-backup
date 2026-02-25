@@ -1,0 +1,12 @@
+# ISDS Backup Configuration
+# Copy to config.neon and fill in your credentials
+
+# true = production (mojedatovaschranka.cz)
+# false = test environment (czebox.cz)
+production: false
+
+databoxes:
+    -
+        id: my-databox
+        login: your_login
+        password: your_password
