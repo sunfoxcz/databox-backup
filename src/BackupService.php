@@ -223,6 +223,7 @@ final class BackupService
         // Save attachments from the message envelope
         $dataMessage = $message->getDataMessage();
         $files = $dataMessage->getFiles();
+        $usedFilenames = [];
 
         foreach ($files as $file) {
             $filename = $file->getDescription();
@@ -236,12 +237,29 @@ final class BackupService
                 $filename = 'attachment_' . uniqid();
             }
 
+            // Deduplicate filenames to avoid overwriting
+            $originalFilename = $filename;
+            $counter = 1;
+            while (isset($usedFilenames[$filename])) {
+                $pathInfo = pathinfo($originalFilename);
+                $filename = ($pathInfo['filename'] ?? 'file') . '_' . $counter;
+                if (isset($pathInfo['extension'])) {
+                    $filename .= '.' . $pathInfo['extension'];
+                }
+                $counter++;
+            }
+            $usedFilenames[$filename] = true;
+
             $content = $file->getEncodedContent();
             if ($content !== null) {
-                // SplFileInfo::getContents() returns already-decoded binary data
                 file_put_contents(
                     $targetDir . '/' . $filename,
                     $content->getContents(),
+                );
+            } elseif ($file->getXmlContent() !== null) {
+                file_put_contents(
+                    $targetDir . '/' . $filename,
+                    $file->getXmlContent(),
                 );
             }
         }
