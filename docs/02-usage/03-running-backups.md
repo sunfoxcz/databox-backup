@@ -41,20 +41,27 @@ It maps the current directory into the container and runs as your user, so files
 
 ## Incremental Behavior
 
-The tool checks whether each message's target directory already exists before downloading.
-Existing messages are skipped automatically, making repeated runs safe and efficient.
+The tool skips messages whose final directory already exists. New downloads are
+first written to a hidden staging directory alongside the destination. The final
+directory appears only after the envelope and payload are saved. If a download
+fails, the next run can retry it while the message is still available in ISDS.
 
-To force re-download of a specific message, delete its directory:
+This does not change existing directories, including incomplete backups made by
+older versions. If you identify an incomplete backup and the message is still
+available, move that message's directory outside the backup tree before rerunning.
+Keep the old copy until you have verified the replacement.
+
+To run the offline retry regression test after installing Composer dependencies:
 
 ```bash
-rm -rf data/{boxId}/{received|sent}/{year}/{month}/{YYYYMMDD}_{messageId}
+./docker-php tests/backup-retry.php
 ```
 
 ## Exit Codes
 
 | Code | Meaning                                                       |
 |------|---------------------------------------------------------------|
-| `0`  | All databoxes backed up successfully                          |
+| `0`  | No fatal error; individual messages may still have failed                          |
 | `1`  | Configuration error or at least one databox had a fatal error |
 
 Individual message errors do not cause a non-zero exit code — they are logged and the backup continues.
