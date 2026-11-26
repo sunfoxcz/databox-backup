@@ -205,11 +205,44 @@ final class BackupService
         MessageRecord $record,
         string $direction,
     ): void {
-        if (!mkdir($targetDir, 0755, true) && !is_dir($targetDir)) {
-            throw new \RuntimeException(sprintf('Failed to create directory: %s', $targetDir));
+        $parentDir = dirname($targetDir);
+        if (!is_dir($parentDir) && !@mkdir($parentDir, 0755, true) && !is_dir($parentDir)) {
+            throw new \RuntimeException(sprintf('Failed to create directory: %s', $parentDir));
         }
 
-        // Save envelope metadata as JSON
+        // Stage beside the destination so publishing is a single filesystem rename.
+        // The incremental check can only see the final directory once all writes succeed.
+        $stagingDir = $parentDir . '/.partial-' . basename($targetDir) . '-' . bin2hex(random_bytes(8));
+        if (!@mkdir($stagingDir, 0700)) {
+            throw new \RuntimeException(sprintf('Failed to create staging directory: %s', $stagingDir));
+        }
+
+        try {
+            $this->saveMessage($account, $messageId, $stagingDir, $record, $direction);
+            if (!@chmod($stagingDir, 0755 & ~umask()) || !@rename($stagingDir, $targetDir)) {
+                throw new \RuntimeException(sprintf('Failed to publish message directory: %s', $targetDir));
+            }
+        } finally {
+            // Also runs on failure. Interrupted processes can leave a staging directory,
+            // but its unique name never matches the final destination.
+            if (is_dir($stagingDir)) {
+                foreach (@scandir($stagingDir) ?: [] as $entry) {
+                    if ($entry !== '.' && $entry !== '..') {
+                        @unlink($stagingDir . '/' . $entry);
+                    }
+                }
+                @rmdir($stagingDir);
+            }
+        }
+    }
+
+    private function saveMessage(
+        Account $account,
+        string $messageId,
+        string $targetDir,
+        MessageRecord $record,
+        string $direction,
+    ): void {
         $envelope = [
             'messageId' => $messageId,
             'sender' => $record->getSender(),
@@ -222,9 +255,9 @@ final class BackupService
             'status' => $record->getMessageStatus(),
             'attachmentSize' => $record->getAttachmentSize(),
         ];
-        file_put_contents(
+        $this->writeFile(
             $targetDir . '/envelope.json',
-            json_encode($envelope, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE),
+            json_encode($envelope, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
         );
 
         if ($direction === 'sent') {
@@ -250,7 +283,7 @@ final class BackupService
 
         $dataMessage = $message->getDataMessage();
         $files = $dataMessage->getFiles();
-        $usedFilenames = [];
+        $usedFilenames = ['envelope.json' => true];
 
         foreach ($files as $file) {
             $filename = $file->getDescription();
@@ -260,14 +293,14 @@ final class BackupService
 
             // Sanitize filename: keep word characters, hyphens, dots, and spaces
             $filename = preg_replace('/[^\w\-. ]/', '_', $filename);
-            if ($filename === null || $filename === '') {
+            if ($filename === null || in_array($filename, ['', '.', '..'], true)) {
                 $filename = 'attachment_' . uniqid();
             }
 
             // Deduplicate filenames to avoid overwriting
             $originalFilename = $filename;
             $counter = 1;
-            while (isset($usedFilenames[$filename])) {
+            while (isset($usedFilenames[strtolower($filename)])) {
                 $pathInfo = pathinfo($originalFilename);
                 $filename = ($pathInfo['filename'] ?? 'file') . '_' . $counter;
                 if (isset($pathInfo['extension'])) {
@@ -275,20 +308,13 @@ final class BackupService
                 }
                 $counter++;
             }
-            $usedFilenames[$filename] = true;
+            $usedFilenames[strtolower($filename)] = true;
 
-            $content = $file->getEncodedContent();
-            if ($content !== null) {
-                file_put_contents(
-                    $targetDir . '/' . $filename,
-                    $content->getContents(),
-                );
-            } elseif ($file->getXmlContent() !== null) {
-                file_put_contents(
-                    $targetDir . '/' . $filename,
-                    $file->getXmlContent(),
-                );
+            $content = $file->getEncodedContent()?->getContents() ?? $file->getXmlContent();
+            if ($content === null) {
+                throw new \RuntimeException(sprintf('No content returned for attachment: %s', $filename));
             }
+            $this->writeFile($targetDir . '/' . $filename, $content);
         }
     }
 
@@ -304,15 +330,19 @@ final class BackupService
         $downloadRequest->setDataMessageId($messageId);
         $downloadResponse = $this->connector->signedSentMessageDownload($account, $downloadRequest);
 
-        $signature = $downloadResponse->getSignature();
-        if ($signature === null) {
+        $signature = $downloadResponse->getSignature()?->getContents();
+        if ($signature === null || $signature === '') {
             throw new \RuntimeException('No signed message data returned');
         }
 
-        file_put_contents(
-            $targetDir . '/message.zfo',
-            $signature->getContents(),
-        );
+        $this->writeFile($targetDir . '/message.zfo', $signature);
+    }
+
+    private function writeFile(string $path, string $content): void
+    {
+        if (@file_put_contents($path, $content) !== strlen($content)) {
+            throw new \RuntimeException(sprintf('Failed to write complete file: %s', $path));
+        }
     }
 
     private function log(string $message): void
